@@ -1,0 +1,185 @@
+diff --git a/dependencies/IsaacLab b/dependencies/IsaacLab
+--- a/dependencies/IsaacLab
++++ b/dependencies/IsaacLab
+@@ -1 +1 @@
+-Subproject commit 3c6e67bb5c7ada942a6d1884ab69338f57596f77
++Subproject commit 3c6e67bb5c7ada942a6d1884ab69338f57596f77-dirty
+diff --git a/scripts/environments/teleoperation/replay.py b/scripts/environments/teleoperation/replay.py
+index c653a13..30fb258 100644
+--- a/scripts/environments/teleoperation/replay.py
++++ b/scripts/environments/teleoperation/replay.py
+@@ -111,6 +111,12 @@ def get_next_action(episode_data: EpisodeData, return_state: bool = False, task_
+     else:
+         return episode_data.get_next_action()
+ 
++def _state_to_device(data, device):
++    if isinstance(data, dict):
++        return {k: _state_to_device(v, device) for k, v in data.items()}
++    if isinstance(data, torch.Tensor):
++        return data.to(device)
++    return data
+ 
+ def main():
+     """Replay episodes loaded from a file."""
+@@ -193,7 +199,7 @@ def main():
+                             )
+                             env_episode_data_map[env_id] = episode_data
+                             # Set initial state for the new episode
+-                            initial_state = episode_data.get_initial_state()
++                            initial_state = _state_to_device(episode_data.get_initial_state(), env.device)
+                             env.reset_to(
+                                 initial_state,
+                                 torch.tensor([env_id], device=env.device),
+diff --git a/scripts/environments/teleoperation/teleop_se3_agent.py b/scripts/environments/teleoperation/teleop_se3_agent.py
+index 573738f..a467482 100644
+--- a/scripts/environments/teleoperation/teleop_se3_agent.py
++++ b/scripts/environments/teleoperation/teleop_se3_agent.py
+@@ -36,6 +36,15 @@ parser.add_argument(
+ parser.add_argument(
+     "--port", type=str, default="/dev/ttyACM0", help="Port for the teleop device:so101leader, default is /dev/ttyACM0"
+ )
++parser.add_argument(
++    "--remote_endpoint",
++    type=str,
++    default=None,
++    help=(
++        "ZMQ endpoint for remote so101leader (e.g. tcp://192.168.1.10:5556). Uses so101_joint_state_server.py on the"
++        " remote machine."
++    ),
++)
+ parser.add_argument(
+     "--left_arm_port",
+     type=str,
+@@ -246,9 +255,14 @@ def main():  # noqa: C901
+ 
+         teleop_interface = SO101Gamepad(env, sensitivity=args_cli.sensitivity)
+     elif args_cli.teleop_device == "so101leader":
+-        from leisaac.devices import SO101Leader
++        if args_cli.remote_endpoint:
++            from leisaac.devices import SO101LeaderRemote
++
++            teleop_interface = SO101LeaderRemote(env, endpoint=args_cli.remote_endpoint)
++        else:
++            from leisaac.devices import SO101Leader
+ 
+-        teleop_interface = SO101Leader(env, port=args_cli.port, recalibrate=args_cli.recalibrate)
++            teleop_interface = SO101Leader(env, port=args_cli.port, recalibrate=args_cli.recalibrate)
+     elif args_cli.teleop_device == "bi-so101leader":
+         from leisaac.devices import BiSO101Leader
+ 
+diff --git a/source/leisaac/leisaac/devices/__init__.py b/source/leisaac/leisaac/devices/__init__.py
+index d6f1a75..9239987 100644
+--- a/source/leisaac/leisaac/devices/__init__.py
++++ b/source/leisaac/leisaac/devices/__init__.py
+@@ -3,3 +3,5 @@ from .gamepad import SO101Gamepad
+ from .keyboard import SO101Keyboard
+ from .lekiwi import LeKiwiGamepad, LeKiwiKeyboard, LeKiwiLeader
+ from .lerobot import BiSO101Leader, SO101Leader
++
++from .so101_leader_quest import SO101LeaderQuest
+diff --git a/source/leisaac/leisaac/devices/action_process.py b/source/leisaac/leisaac/devices/action_process.py
+index 6abcc5d..1827de3 100644
+--- a/source/leisaac/leisaac/devices/action_process.py
++++ b/source/leisaac/leisaac/devices/action_process.py
+@@ -8,7 +8,7 @@ from leisaac.assets.robots.lerobot import SO101_FOLLOWER_USD_JOINT_LIMLITS
+ 
+ def init_action_cfg(action_cfg, device):
+     """SO101 Follower action configuration: arm_action and gripper_action"""
+-    if device in ["so101leader", "lekiwi-leader"]:
++    if device in ["so101leader", "quest", "lekiwi-leader"]:
+         action_cfg.arm_action = mdp.JointPositionActionCfg(
+             asset_name="robot",
+             joint_names=["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"],
+@@ -189,6 +189,10 @@ def preprocess_device_action(action: dict[str, Any], teleop_device) -> torch.Ten
+     elif action.get("lekiwi-keyboard") is not None or action.get("lekiwi-gamepad") is not None:
+         processed_action = torch.zeros(teleop_device.env.num_envs, 11, device=teleop_device.env.device)
+         processed_action[:, :] = action["joint_state"]
++    elif action.get("quest") is not None:
++        processed_action = torch.zeros(teleop_device.env.num_envs, 6, device=teleop_device.env.device)
++        processed_action[:, :] = action["joint_state"]
++        
+     else:
+         raise NotImplementedError(f"Not implemented for this device now: {teleop_device.device_type}")
+     return processed_action
+diff --git a/source/leisaac/leisaac/enhance/managers/recorder_manager.py b/source/leisaac/leisaac/enhance/managers/recorder_manager.py
+index 5a5fa34..6b40a0e 100644
+--- a/source/leisaac/leisaac/enhance/managers/recorder_manager.py
++++ b/source/leisaac/leisaac/enhance/managers/recorder_manager.py
+@@ -51,7 +51,7 @@ class StreamingRecorderManager(RecorderManager):
+             )
+ 
+         self._env_steps_record = torch.zeros(self._env.num_envs)
+-        self._flush_steps = 100
++        self._flush_steps = 10
+         self._compression = None
+         if self._dataset_file_handler is not None:
+             self._dataset_file_handler.chunks_length = self._flush_steps
+diff --git a/source/leisaac/leisaac/tasks/template/single_arm_env_cfg.py b/source/leisaac/leisaac/tasks/template/single_arm_env_cfg.py
+index d337a20..0935905 100644
+--- a/source/leisaac/leisaac/tasks/template/single_arm_env_cfg.py
++++ b/source/leisaac/leisaac/tasks/template/single_arm_env_cfg.py
+@@ -47,23 +47,23 @@ class SingleArmTaskSceneCfg(InteractiveSceneCfg):
+         ],
+     )
+ 
+-    wrist: TiledCameraCfg = TiledCameraCfg(
+-        prim_path="{ENV_REGEX_NS}/Robot/gripper/wrist_camera",
+-        offset=TiledCameraCfg.OffsetCfg(
+-            pos=(-0.001, 0.1, -0.04), rot=(-0.404379, -0.912179, -0.0451242, 0.0486914), convention="ros"
+-        ),  # wxyz
+-        data_types=["rgb"],
+-        spawn=sim_utils.PinholeCameraCfg(
+-            focal_length=36.5,
+-            focus_distance=400.0,
+-            horizontal_aperture=36.83,  # For a 75° FOV (assuming square image)
+-            clipping_range=(0.01, 50.0),
+-            lock_camera=True,
+-        ),
+-        width=640,
+-        height=480,
+-        update_period=1 / 30.0,  # 30FPS
+-    )
++#    wrist: TiledCameraCfg = TiledCameraCfg(
++#        prim_path="{ENV_REGEX_NS}/Robot/gripper/wrist_camera",
++#        offset=TiledCameraCfg.OffsetCfg(
++#            pos=(-0.001, 0.1, -0.04), rot=(-0.404379, -0.912179, -0.0451242, 0.0486914), #convention="ros"
++#        ),  # wxyz
++#        data_types=["rgb"],
++#        spawn=sim_utils.PinholeCameraCfg(
++#            focal_length=36.5,
++#            focus_distance=400.0,
++#            horizontal_aperture=36.83,  # For a 75° FOV (assuming square image)
++#            clipping_range=(0.01, 50.0),
++#            lock_camera=True,
++#        ),
++#        width=320,
++#        height=240,
++#        update_period=1 / 30.0,  # 30FPS
++#    )
+ 
+     front: TiledCameraCfg = TiledCameraCfg(
+         prim_path="{ENV_REGEX_NS}/Robot/base/front_camera",
+@@ -78,8 +78,8 @@ class SingleArmTaskSceneCfg(InteractiveSceneCfg):
+             clipping_range=(0.01, 50.0),
+             lock_camera=True,
+         ),
+-        width=640,
+-        height=480,
++        width=320,
++        height=240,
+         update_period=1 / 30.0,  # 30FPS
+     )
+ 
+@@ -118,9 +118,9 @@ class SingleArmObservationsCfg:
+         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
+         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+         actions = ObsTerm(func=mdp.last_action)
+-        wrist = ObsTerm(
+-            func=mdp.image, params={"sensor_cfg": SceneEntityCfg("wrist"), "data_type": "rgb", "normalize": False}
+-        )
++#        wrist = ObsTerm(
++#            func=mdp.image, params={"sensor_cfg": SceneEntityCfg("wrist"), "data_type": "rgb", "normalize": False}
++#        )
+         front = ObsTerm(
+             func=mdp.image, params={"sensor_cfg": SceneEntityCfg("front"), "data_type": "rgb", "normalize": False}
+         )
